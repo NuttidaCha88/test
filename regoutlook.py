@@ -9,7 +9,6 @@ import os
 import sys
 import atexit
 import signal
-import traceback
 import base64
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
@@ -21,16 +20,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.common.keys import Keys
-import queue
-from dataclasses import dataclass
-from datetime import datetime
 
 # Bổ sung biến và locks mới để tránh nghẽn cổ chai
 excel_io_lock = threading.Lock()  # Lock riêng cho thao tác Excel
 log_io_lock = threading.Lock()    # Lock cho các hoạt động ghi log
 api_lock = threading.Lock()       # Lock cho các API request (nếu cần)
 recovery_email_lock = threading.Lock() # Lock cho việc quản lý email khôi phục
-profile_access_lock = threading.Lock()  # Lock cho việc truy cập/sửa đổi thông tin profile
 
 # Trạng thái các profile đang xử lý (để khôi phục khi bị tắt đột ngột)
 processing_profiles = {}
@@ -43,26 +38,6 @@ using_recovery_emails = {}  # thread_id -> email
 # Biến để theo dõi trạng thái chương trình
 is_shutting_down = False
 
-# Queue cho các thao tác Excel để tránh nhiều thread cùng cập nhật
-excel_update_queue = queue.Queue()
-excel_worker_thread = None
-excel_worker_running = False
-
-# Cấu trúc dữ liệu cho các thao tác Excel
-@dataclass
-class ExcelUpdateTask:
-    row: int
-    column: int  
-    value: str
-    fill: any = None
-    fill_range: tuple = None  # (start_col, end_col)
-
-# Cấu trúc dữ liệu cho việc cập nhật nhiều ô trong Excel
-@dataclass
-class ExcelBatchUpdateTask:
-    updates: list  # Danh sách các ExcelUpdateTask
-    save_after: bool = True
-
 # ---------------------------------------
 # Hàm ghi log thread-safe
 # ---------------------------------------
@@ -70,9 +45,8 @@ def write_to_log(filename, content):
     """Hàm ghi log thread-safe"""
     with log_io_lock:
         try:
-            with open(filename, "a", encoding="utf-8") as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                f.write(f"[{timestamp}] {content}\n")
+            with open(filename, "a") as f:
+                f.write(content + "\n")
             return True
         except Exception as e:
             print(f"Lỗi khi ghi vào file {filename}: {e}")
@@ -257,22 +231,18 @@ def recover_from_previous_run():
                 print(f"Phát hiện {len(interrupted_profiles)} profile bị gián đoạn từ lần chạy trước")
                 
                 # Đánh dấu các profile này là "Bị gián đoạn" trong Excel
-                batch_updates = []
-                for profile_id, info in interrupted_profiles.items():
-                    row = info.get("row")
-                    if row:
-                        try:
-                            # Tạo một update task thay vì truy cập trực tiếp
-                            batch_updates.append(
-                                ExcelUpdateTask(row=row, column=10, value="Bị gián đoạn")
-                            )
-                            print(f"Đã đánh dấu profile {profile_id} (hàng {row}) là 'Bị gián đoạn'")
-                        except:
-                            print(f"Không thể đánh dấu profile {profile_id}")
-                
-                # Thêm các cập nhật vào hàng đợi nếu có
-                if batch_updates:
-                    queue_excel_batch_update(batch_updates, save_after=True)
+                with excel_io_lock:
+                    for profile_id, info in interrupted_profiles.items():
+                        row = info.get("row")
+                        if row:
+                            try:
+                                worksheet.cell(row=row, column=10).value = "Bị gián đoạn"
+                                print(f"Đã đánh dấu profile {profile_id} (hàng {row}) là 'Bị gián đoạn'")
+                            except:
+                                print(f"Không thể đánh dấu profile {profile_id}")
+                    
+                    # Lưu thay đổi
+                    save_excel_with_retry()
                 
                 # Xóa file trạng thái
                 os.remove("processing_profiles.json")
@@ -553,41 +523,6 @@ def get_refresh_token(driver, wait, username, password, thread_id, profile_id, r
             print(f"Thread {thread_id}: Truy cập https://tolive.site, đang chờ chuyển hướng...")
             time.sleep(5)
             # Đợi trang load xong trong 60 giây
-            tolive_page_loaded = False
-            start_loading_time = time.time()
-            
-            while time.time() - start_loading_time < 60:
-                # Kiểm tra xem trang đã tải hoàn tất chưa
-                page_ready_state = driver.execute_script("return document.readyState")
-                if page_ready_state == "complete":
-                    tolive_page_loaded = True
-                    print(f"Thread {thread_id}: Trang tolive.site đã load xong sau {int(time.time() - start_loading_time)} giây")
-                    break
-                time.sleep(1)  # Kiểm tra mỗi giây
-            
-            if not tolive_page_loaded:
-                print(f"Thread {thread_id}: Trang tolive.site không load được trong vòng 60 giây, đóng profile và chuyển tới profile tiếp theo")
-                
-                # Đánh dấu là lỗi tải trang tolive.site trong Excel
-                queue_excel_update(row=row_number, column=10, value="Lỗi Tải Trang Tolive.site", save_now=True)
-                
-                # Đóng profile
-                close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                try:
-                    requests.get(close_url)
-                    print(f"Thread {thread_id}: Đã đóng profile {profile_id} do lỗi tải trang tolive.site")
-                except Exception as e:
-                    print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {e}")
-                
-                # Giải phóng email khôi phục nếu đã được chỉ định
-                #release_recovery_email(thread_id)
-                
-                # Chuyển đến profile tiếp theo
-                mark_profile_as_completed(profile_id)
-                return None
-                
-            #time.sleep(5)
-            # Đợi trang load xong trong 60 giây
             try:
                 WebDriverWait(driver, 60).until(lambda d: d.execute_script("return document.readyState") == "complete")
                 print(f"Thread {thread_id}: Trang tolive.site đã load xong")
@@ -599,15 +534,21 @@ def get_refresh_token(driver, wait, username, password, thread_id, profile_id, r
             
             # Kiểm tra xem tài khoản có bị khóa không TRƯỚC khi kiểm tra newSessionLink
             try:
-                account_locked_element = WebDriverWait(driver, 3).until(
-                    EC.presence_of_element_located((By.XPATH, "//div[@role='heading' and @aria-level='1' and @id='serviceAbuseLandingTitle']"))
+                account_locked_element = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.XPATH, "//div[@role='heading' and contains(text(), 'Tài khoản của bạn đã bị khóa') or contains(text(), 'Your account has been suspended')]"))
                 )
                 print(f"Thread {thread_id}: [CẢNH BÁO] Phát hiện thông báo tài khoản bị khóa")
                 
                 
                 # Đánh dấu là tài khoản bị khóa trong Excel
-                queue_excel_update(row=row_number, column=10, value="Tài khoản bị khóa", fill=red_fill, fill_range=(1, 11), save_now=True)
-                print(f"Thread {thread_id}: Đã đánh dấu 'Tài khoản bị khóa' cho profile {profile_id}")
+                with profiles_lock:
+                    worksheet.cell(row=row_number, column=10).value = "Tài khoản bị khóa"
+                    # Tô đỏ dòng đó
+                    for col in range(1, 12):  # Bao gồm cả cột K (cột thứ 11)
+                        worksheet.cell(row=row_number, column=col).fill = red_fill
+                    # Lưu file Excel
+                    save_excel_with_retry()
+                    print(f"Thread {thread_id}: Đã đánh dấu 'Tài khoản bị khóa' cho profile {profile_id}")
                 
                 # Đóng profile
                 close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
@@ -616,10 +557,8 @@ def get_refresh_token(driver, wait, username, password, thread_id, profile_id, r
                     print(f"Thread {thread_id}: Đã đóng profile {profile_id} do tài khoản bị khóa")
                 except Exception as e:
                     print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {e}")
-                    
                 
-                mark_profile_as_completed(profile_id)
-                return None
+                return "ACCOUNT_LOCKED"
                 
             except TimeoutException:
                 print(f"Thread {thread_id}: Không phát hiện thông báo tài khoản bị khóa trước bước kiểm tra newSessionLink")
@@ -628,7 +567,7 @@ def get_refresh_token(driver, wait, username, password, thread_id, profile_id, r
             
             # Kiểm tra xem có phần tử newSessionLink không
             try:
-                new_session_link = WebDriverWait(driver, 3).until(
+                new_session_link = WebDriverWait(driver, 5).until(
                     EC.element_to_be_clickable((By.ID, "newSessionLink"))
                 )
                 print(f"Thread {thread_id}: Phát hiện phần tử newSessionLink (tài khoản đã đăng nhập trước đó), đang click vào...")
@@ -651,14 +590,20 @@ def get_refresh_token(driver, wait, username, password, thread_id, profile_id, r
             # Bổ sung thêm bước kiểm tra tài khoản bị khóa
             try:
                 account_locked_element = WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((By.XPATH, "//div[@role='heading' and @aria-level='1' and @id='serviceAbuseLandingTitle']"))
+                    EC.presence_of_element_located((By.XPATH, "//div[@role='heading' and contains(text(), 'Tài khoản của bạn đã bị khóa') or contains(text(), 'Your account has been suspended')]"))
                 )
                 print(f"Thread {thread_id}: [CẢNH BÁO] Phát hiện thông báo tài khoản bị khóa")
                 
                 
                 # Đánh dấu là tài khoản bị khóa trong Excel
-                queue_excel_update(row=row_number, column=10, value="Tài khoản bị khóa", fill=red_fill, fill_range=(1, 11), save_now=True)
-                print(f"Thread {thread_id}: Đã đánh dấu 'Tài khoản bị khóa' cho profile {profile_id}")
+                with profiles_lock:
+                    worksheet.cell(row=row_number, column=10).value = "Tài khoản bị khóa"
+                    # Tô đỏ dòng đó
+                    for col in range(1, 12):  # Bao gồm cả cột K (cột thứ 11)
+                        worksheet.cell(row=row_number, column=col).fill = red_fill
+                    # Lưu file Excel
+                    save_excel_with_retry()
+                    print(f"Thread {thread_id}: Đã đánh dấu 'Tài khoản bị khóa' cho profile {profile_id}")
                 
                 # Đóng profile
                 close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
@@ -667,14 +612,45 @@ def get_refresh_token(driver, wait, username, password, thread_id, profile_id, r
                     print(f"Thread {thread_id}: Đã đóng profile {profile_id} do tài khoản bị khóa")
                 except Exception as e:
                     print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {e}")
-                mark_profile_as_completed(profile_id)
-                return None
+                
+                return "ACCOUNT_LOCKED"
                 
             except TimeoutException:
                 print(f"Thread {thread_id}: Không phát hiện thông báo tài khoản bị khóa, tiếp tục quy trình")
             except Exception as e:
                 print(f"Thread {thread_id}: Lỗi khi kiểm tra tài khoản bị khóa: {e}")
             
+            # Kiểm tra xem tài khoản có bị khóa không
+            try:
+                account_locked_element = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.XPATH, "//div[@role='heading' and @aria-level='1' and @id='serviceAbuseLandingTitle' and contains(text(), 'Tài khoản của bạn đã bị khóa')]"))
+                )
+                print(f"Thread {thread_id}: [CẢNH BÁO] Phát hiện thông báo 'Tài khoản của bạn đã bị khóa'")
+                
+                # Đánh dấu là tài khoản bị khóa trong Excel
+                with profiles_lock:
+                    worksheet.cell(row=row_number, column=10).value = "Tài khoản bị khóa"
+                    # Tô đỏ dòng đó
+                    for col in range(1, 11):
+                        worksheet.cell(row=row_number, column=col).fill = red_fill
+                    # Lưu file Excel
+                    save_excel_with_retry()
+                    print(f"Thread {thread_id}: Đã đánh dấu 'Tài khoản bị khóa' cho profile {profile_id}")
+                
+                # Đóng profile
+                close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
+                try:
+                    requests.get(close_url)
+                    print(f"Thread {thread_id}: Đã đóng profile {profile_id} do tài khoản bị khóa")
+                except Exception as e:
+                    print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {e}")
+                
+                return "ACCOUNT_LOCKED"
+                
+            except TimeoutException:
+                print(f"Thread {thread_id}: Không phát hiện thông báo 'Tài khoản của bạn đã bị khóa', tiếp tục quy trình")
+            except Exception as e:
+                print(f"Thread {thread_id}: Lỗi khi kiểm tra tài khoản bị khóa: {e}")
             
             # Đợi phần tử animation xuất hiện trong 60 giây
             try:
@@ -694,7 +670,7 @@ def get_refresh_token(driver, wait, username, password, thread_id, profile_id, r
                     print(f"Thread {thread_id}: Đã nhấp vào nút Consent/Đồng ý")
                     
                     # Đợi trang load xong và chuyển hướng đến trang kết quả
-                    WebDriverWait(driver, 30).until(
+                    WebDriverWait(driver, 60).until(
                         lambda d: "getAToken" in d.current_url
                     )
                     print(f"Thread {thread_id}: Đã chuyển hướng đến trang kết quả")
@@ -734,8 +710,14 @@ def get_refresh_token(driver, wait, username, password, thread_id, profile_id, r
                 print(f"Thread {thread_id}: [LỖI] Không tìm thấy phần tử animation sau khi đợi 60 giây")
                 
                 # Đánh dấu là lỗi token trong Excel
-                queue_excel_update(row=row_number, column=10, value="Lỗi Token - Không tìm thấy animation", fill=red_fill, fill_range=(1, 10), save_now=True)
-                print(f"Thread {thread_id}: Đã đánh dấu 'Lỗi Token - Không tìm thấy animation' cho profile {profile_id}")
+                with profiles_lock:
+                    worksheet.cell(row=row_number, column=10).value = "Lỗi Token - Không tìm thấy animation"
+                    # Tô đỏ dòng đó
+                    for col in range(1, 11):
+                        worksheet.cell(row=row_number, column=col).fill = red_fill
+                    # Lưu file Excel
+                    save_excel_with_retry()
+                    print(f"Thread {thread_id}: Đã đánh dấu 'Lỗi Token - Không tìm thấy animation' cho profile {profile_id}")
                 
                 # Đóng profile
                 close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
@@ -1085,7 +1067,7 @@ def process_profile(thread_id, api_key, window_pos):
         browser_location = start_data.get("data", {}).get("browser_location")
 
         if not driver_path or not remote_debugging_address:
-            print(f"Thread {thread_id}: Missing driver_path hoặc not remote_debugging_address, skipping profile.")
+            print(f"Thread {thread_id}: Missing driver_path or not remote_debugging_address, skipping profile.")
             mark_profile_as_completed(profile_id)
             continue
 
@@ -1111,44 +1093,14 @@ def process_profile(thread_id, api_key, window_pos):
             
             try:
                 driver.get(outlook_signup_url)
-                
-                # Thiết lập thời gian chờ tối đa 60 giây và kiểm tra trang đã tải xong hay chưa
-                signup_page_loaded = False
-                start_loading_time = time.time()
-                
-                while time.time() - start_loading_time < 60:
-                    # Kiểm tra xem trang đã tải hoàn tất chưa
-                    page_ready_state = driver.execute_script("return document.readyState")
-                    if page_ready_state == "complete":
-                        signup_page_loaded = True
-                        print(f"Thread {thread_id}: Outlook signup page loaded successfully after {int(time.time() - start_loading_time)} seconds")
-                        break
-                    time.sleep(1)  # Kiểm tra mỗi giây
-                
-                if not signup_page_loaded:
-                    print(f"Thread {thread_id}: Outlook signup page did not load within 60 seconds, closing profile and moving to next")
-                    
-                    # Đánh dấu là lỗi tải trang đăng ký trong Excel
-                    queue_excel_update(row=row_number, column=10, value="Lỗi Tải Trang Đăng Ký", save_now=True)
-                    
-                    # Đóng profile
-                    close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                    try:
-                        requests.get(close_url)
-                        print(f"Thread {thread_id}: Closed profile {profile_id} due to signup page load timeout")
-                    except Exception as e:
-                        print(f"Thread {thread_id}: Error closing profile {profile_id}: {e}")
-                    
-                    # Chuyển đến profile tiếp theo
-                    mark_profile_as_completed(profile_id)
-                    continue
-                
+                wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
                 print(f"Thread {thread_id}: Outlook signup page loaded.")
+                #time.sleep(3)  # Đợi thêm để trang hiển thị hoàn chỉnh
                 
                 # Tạo username ngẫu nhiên
                 first_name, last_name = generate_random_name()
                 username_base = (first_name + last_name).lower()
-                random_digits = ''.join([str(random.randint(0, 9)) for _ in range(5)])
+                random_digits = ''.join([str(random.randint(0, 9)) for _ in range(4)])
                 username = username_base + random_digits
                 email = username + "@outlook.com"  # Thêm @outlook.com trực tiếp vào username
                 
@@ -1217,7 +1169,9 @@ def process_profile(thread_id, api_key, window_pos):
                 except TimeoutException:
                     print(f"Thread {thread_id}: Timeout waiting for password input. Could be slow proxy or page error.")
                     # Đánh dấu là lỗi proxy trong Excel
-                    queue_excel_update(row=row_number, column=10, value="Lỗi Proxy - Không tìm thấy trường mật khẩu", save_now=True)
+                    with profiles_lock:
+                        worksheet.cell(row=row_number, column=10).value = "Lỗi Proxy - Không tìm thấy trường mật khẩu"
+                        save_excel_with_retry()
                     
                     # Đóng profile và chuyển đến profile tiếp theo
                     close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
@@ -1405,15 +1359,21 @@ def process_profile(thread_id, api_key, window_pos):
                 
                 # Kiểm tra xem tài khoản có bị khóa không sau khi bấm Next
                 try:
-                    account_locked_element = WebDriverWait(driver, 20).until(
+                    account_locked_element = WebDriverWait(driver, 10).until(
                         EC.presence_of_element_located((By.XPATH, "//div[@role='heading' and @aria-level='1' and @id='riskApiBlockedViewTitle']"))
                     )
                     print(f"Thread {thread_id}: [CẢNH BÁO] Phát hiện thông báo tài khoản bị khóa")
                     
                     
                     # Đánh dấu là tài khoản bị khóa trong Excel
-                    queue_excel_update(row=row_number, column=10, value="Tài khoản bị khóa", fill=red_fill, fill_range=(1, 11), save_now=True)
-                    print(f"Thread {thread_id}: Đã đánh dấu 'Tài khoản bị khóa' cho profile {profile_id}")
+                    with profiles_lock:
+                        worksheet.cell(row=row_number, column=10).value = "Tài khoản bị khóa"
+                        # Tô đỏ dòng đó
+                        for col in range(1, 12):  # Bao gồm cả cột K (cột thứ 11)
+                            worksheet.cell(row=row_number, column=col).fill = red_fill
+                        # Lưu file Excel
+                        save_excel_with_retry()
+                        print(f"Thread {thread_id}: Đã đánh dấu 'Tài khoản bị khóa' cho profile {profile_id}")
                     
                     # Đóng profile
                     close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
@@ -1422,9 +1382,8 @@ def process_profile(thread_id, api_key, window_pos):
                         print(f"Thread {thread_id}: Đã đóng profile {profile_id} do tài khoản bị khóa")
                     except Exception as e:
                         print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {e}")
-                        
-                    mark_profile_as_completed(profile_id)
-                    continue
+                    
+                    return "ACCOUNT_LOCKED"
                     
                 except TimeoutException:
                     print(f"Thread {thread_id}: Không phát hiện thông báo tài khoản bị khóa sau khi bấm Next")
@@ -1452,9 +1411,9 @@ def process_profile(thread_id, api_key, window_pos):
                             
                             # Thử kiểm tra bằng JavaScript
                             is_visible = driver.execute_script(
-                                "return arguments[0].offsetParent !== null and "
-                                "arguments[0].offsetWidth > 0 and "
-                                "arguments[0].offsetHeight > 0 and "
+                                "return arguments[0].offsetParent !== null && "
+                                "arguments[0].offsetWidth > 0 && "
+                                "arguments[0].offsetHeight > 0 && "
                                 "window.getComputedStyle(arguments[0]).visibility !== 'hidden'", 
                                 loading_element
                             )
@@ -1478,8 +1437,14 @@ def process_profile(thread_id, api_key, window_pos):
                         print(f"Thread {thread_id}: Loading animation still visible after 60 seconds, marking as error and closing profile")
                         
                         # Đánh dấu là lỗi giải captcha trong Excel
-                        queue_excel_update(row=row_number, column=10, value="Lỗi Giải Captcha", fill=red_fill, fill_range=(1, 10), save_now=True)
-                        print(f"Thread {thread_id}: Đã đánh dấu Lỗi Giải Captcha cho profile {profile_id}")
+                        with profiles_lock:
+                            worksheet.cell(row=row_number, column=10).value = "Lỗi Giải Captcha"
+                            # Tô đỏ dòng đó
+                            for col in range(1, 11):
+                                worksheet.cell(row=row_number, column=col).fill = red_fill
+                            # Lưu file Excel
+                            save_excel_with_retry()
+                            print(f"Thread {thread_id}: Đã đánh dấu Lỗi Giải Captcha cho profile {profile_id}")
                         
                         # Đóng profile
                         close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
@@ -1502,8 +1467,8 @@ def process_profile(thread_id, api_key, window_pos):
                 
                 # Click nút OK (nếu xuất hiện)
                 try:
-                    ok_button = WebDriverWait(driver, 60).until(
-                        EC.element_to_be_clickable((By.XPATH, "//span[text() = 'OK']"))
+                    ok_button = WebDriverWait(driver, 20).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "span.ms-Button-label[id='id__0']"))
                     )
                     ok_button.click()
                     print(f"Thread {thread_id}: Clicked OK button")
@@ -1511,7 +1476,7 @@ def process_profile(thread_id, api_key, window_pos):
                     print(f"Thread {thread_id}: OK button not found or not clickable")
                 except Exception as e:
                     print(f"Thread {thread_id}: Error clicking OK button: {e}")
-                    
+                
                 # Thêm các bước mở rộng
                 # -------------------------------------------------
                 # 1. Click vào nút Yes nếu xuất hiện và đợi trang tải xong
@@ -1521,134 +1486,38 @@ def process_profile(thread_id, api_key, window_pos):
                     )
                     simulate_human_click(driver, yes_button)
                     print(f"Thread {thread_id}: Clicked Yes button")
-                    time.sleep(10)
+                    # Đợi trang load xong
+                    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                    time.sleep(3)
                 except TimeoutException:
                     print(f"Thread {thread_id}: Yes button not found or not clickable (might not appear)")
                 except Exception as e:
                     print(f"Thread {thread_id}: Error clicking Yes button: {e}")
-                    
+                
                 # 2. Truy cập trang bảo mật
                 try:
                     security_url = "https://account.microsoft.com/security?lang=en-US#main-content-landing-react"
                     print(f"Thread {thread_id}: Navigating to security page: {security_url}")
                     driver.get(security_url)
-                    
-                    # Thiết lập thời gian chờ tối đa 60 giây và kiểm tra trang đã tải xong hay chưa
-                    security_page_loaded = False
-                    start_loading_time = time.time()
-                    
-                    while time.time() - start_loading_time < 60:
-                        # Kiểm tra xem trang đã tải hoàn tất chưa
-                        page_ready_state = driver.execute_script("return document.readyState")
-                        if page_ready_state == "complete":
-                            security_page_loaded = True
-                            print(f"Thread {thread_id}: Security page loaded successfully after {int(time.time() - start_loading_time)} seconds")
-                            break
-                        time.sleep(1)  # Kiểm tra mỗi giây
-                    
-                    if not security_page_loaded:
-                        print(f"Thread {thread_id}: Security page did not load within 60 seconds, closing profile and moving to next")
-                        
-                        # Đánh dấu là lỗi tải trang bảo mật trong Excel
-                        queue_excel_update(row=row_number, column=10, value="Lỗi Tải Trang Bảo Mật", save_now=True)
-                        
-                        # Đóng profile
-                        close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                        try:
-                            requests.get(close_url)
-                            print(f"Thread {thread_id}: Closed profile {profile_id} due to security page load timeout")
-                        except Exception as e:
-                            print(f"Thread {thread_id}: Error closing profile {profile_id}: {e}")
-                        
-                        # Giải phóng email khôi phục nếu đã được chỉ định
-                        release_recovery_email(thread_id)
-                        
-                        # Chuyển đến profile tiếp theo
-                        mark_profile_as_completed(profile_id)
-                        continue
-                        
+                    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                    print(f"Thread {thread_id}: Security page loaded")
+                    #time.sleep(3)  # Đợi thêm để đảm bảo trang đã tải hoàn tất
                 except Exception as e:
                     print(f"Thread {thread_id}: Error accessing security page: {e}")
-                    
-                    # Ghi nhật ký lỗi chi tiết để debug
-                    print(f"Thread {thread_id}: Exception details - {type(e).__name__}: {str(e)}")
-                    traceback_info = traceback.format_exc()
-                    print(f"Thread {thread_id}: Traceback:\n{traceback_info}")
-                    
-                    # Đánh dấu lỗi trong Excel
-                    queue_excel_update(row=row_number, column=10, value=f"Lỗi truy cập trang bảo mật: {type(e).__name__}", save_now=True)
-                    
-                    # Đóng profile và giải phóng tài nguyên
-                    close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                    try:
-                        requests.get(close_url)
-                    except Exception as close_err:
-                        print(f"Thread {thread_id}: Error closing profile {profile_id}: {close_err}")
-                    
-                    release_recovery_email(thread_id)
-                    mark_profile_as_completed(profile_id)
-                    continue
                 
                 # 3. Click vào 'View my sign-in activity'
                 try:
-                    # Thiết lập thời gian chờ tối đa 20 giây và kiểm tra phần tử có tồn tại không
-                    print(f"Thread {thread_id}: Đang tìm phần tử 'View my sign-in activity'...")
-                    view_signin_found = False
-                    
-                    try:
-                        view_signin_link = WebDriverWait(driver, 20).until(
-                            EC.element_to_be_clickable((By.XPATH, "//a[normalize-space()='View my sign-in activity']"))
-                        )
-                        view_signin_found = True
-                        simulate_human_click(driver, view_signin_link)
-                        print(f"Thread {thread_id}: Clicked 'View my sign-in activity'")
-                        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-                        time.sleep(3)  # Đợi thêm để trang tải hoàn tất
-                    except TimeoutException:
-                        view_signin_found = False
-                        print(f"Thread {thread_id}: Không tìm thấy phần tử 'View my sign-in activity' sau 20 giây")
-                    
-                    if not view_signin_found:
-                        print(f"Thread {thread_id}: Không tìm thấy phần tử 'View my sign-in activity', đóng profile và chuyển tới profile tiếp theo")
-                        
-                        # Đánh dấu lỗi trong Excel
-                        queue_excel_update(row=row_number, column=10, value="Lỗi Không Tìm Thấy 'View my sign-in activity'", save_now=True)
-                        
-                        # Đóng profile
-                        close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                        try:
-                            requests.get(close_url)
-                            print(f"Thread {thread_id}: Đã đóng profile {profile_id} do không tìm thấy 'View my sign-in activity'")
-                        except Exception as e:
-                            print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {e}")
-                        
-                        # Giải phóng email khôi phục nếu đã được chỉ định
-                        release_recovery_email(thread_id)
-                        
-                        # Chuyển đến profile tiếp theo
-                        mark_profile_as_completed(profile_id)
-                        continue
-                        
+                    view_signin_link = WebDriverWait(driver, 30).until(
+                        EC.element_to_be_clickable((By.XPATH, "//a[normalize-space()='View my sign-in activity']"))
+                    )
+                    simulate_human_click(driver, view_signin_link)
+                    print(f"Thread {thread_id}: Clicked 'View my sign-in activity'")
+                    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                    #time.sleep(5)  # Đợi thêm để trang tải hoàn tất
+                except TimeoutException:
+                    print(f"Thread {thread_id}: 'View my sign-in activity' link not found")
                 except Exception as e:
                     print(f"Thread {thread_id}: Error clicking 'View my sign-in activity': {e}")
-                    
-                    # Đánh dấu lỗi trong Excel
-                    queue_excel_update(row=row_number, column=10, value=f"Lỗi khi click 'View my sign-in activity': {str(e)[:30]}", save_now=True)
-                    
-                    # Đóng profile
-                    close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                    try:
-                        requests.get(close_url)
-                        print(f"Thread {thread_id}: Đã đóng profile {profile_id} do lỗi khi click 'View my sign-in activity'")
-                    except Exception as close_e:
-                        print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {close_e}")
-                    
-                    # Giải phóng email khôi phục nếu đã được chỉ định
-                    release_recovery_email(thread_id)
-                    
-                    # Chuyển đến profile tiếp theo
-                    mark_profile_as_completed(profile_id)
-                    continue
                 
                 # 4. Chọn ngẫu nhiên một Gmail từ file recovery_mail.txt
                 recovery_email_data = None
@@ -1674,41 +1543,9 @@ def process_profile(thread_id, api_key, window_pos):
                 
                 # 5. Nhập Gmail vào trường email khôi phục
                 try:
-                    # Đặt thời gian chờ tối đa 30 giây và theo dõi thời gian
-                    start_time = time.time()
-                    email_input_found = False
-                    
-                    # Đợi phần tử email với timeout 30 giây
-                    while time.time() - start_time < 30 and not email_input_found:
-                        try:
-                            email_input = driver.find_element(By.XPATH, "//input[@id='EmailAddress']")
-                            email_input_found = True
-                            print(f"Thread {thread_id}: Đã tìm thấy phần tử nhập email khôi phục sau {int(time.time() - start_time)} giây")
-                        except NoSuchElementException:
-                            time.sleep(1)  # Kiểm tra mỗi giây
-                    
-                    if not email_input_found:
-                        print(f"Thread {thread_id}: Không tìm thấy phần tử nhập email khôi phục sau 30 giây, đóng profile và chuyển tới profile tiếp theo")
-                        
-                        # Đánh dấu là lỗi không tìm thấy phần tử email khôi phục trong Excel
-                        queue_excel_update(row=row_number, column=10, value="Lỗi Không Tìm Thấy Phần Tử Email Khôi Phục", save_now=True)
-                        
-                        # Đóng profile
-                        close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                        try:
-                            requests.get(close_url)
-                            print(f"Thread {thread_id}: Đã đóng profile {profile_id} do không tìm thấy phần tử email khôi phục")
-                        except Exception as e:
-                            print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {e}")
-                        
-                        # Giải phóng email khôi phục nếu đã được chỉ định
-                        release_recovery_email(thread_id)
-                        
-                        # Chuyển đến profile tiếp theo
-                        mark_profile_as_completed(profile_id)
-                        continue
-                    
-                    # Nhập email khôi phục vào input
+                    email_input = WebDriverWait(driver, 30).until(
+                        EC.presence_of_element_located((By.XPATH, "//input[@id='EmailAddress']"))
+                    )
                     simulate_human_typing(email_input, gmail)
                     print(f"Thread {thread_id}: Đã nhập email khôi phục: {gmail}")
                     
@@ -1719,97 +1556,15 @@ def process_profile(thread_id, api_key, window_pos):
                     simulate_human_click(driver, next_button)
                     print(f"Thread {thread_id}: Clicked Next button after entering recovery email")
                     
-                    # Đợi trang tải xong trong tối đa 60 giây
-                    try:
-                        print(f"Thread {thread_id}: Đang đợi trang tải xong sau khi nhập email khôi phục (tối đa 60 giây)...")
-                        WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
-                        print(f"Thread {thread_id}: Trang đã tải xong sau khi nhập email khôi phục")
-                        time.sleep(5)  # Đợi thêm để trang hoàn tất và email xác minh được gửi
-                    except TimeoutException:
-                        print(f"Thread {thread_id}: Trang không tải xong sau 60 giây sau khi nhập email khôi phục")
-                        
-                        # Đánh dấu là lỗi tải trang sau khi nhập email trong Excel
-                        queue_excel_update(row=row_number, column=10, value="Lỗi Tải Trang Sau Khi Nhập Email Khôi Phục", save_now=True)
-                        
-                        # Đóng profile
-                        close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                        try:
-                            requests.get(close_url)
-                            print(f"Thread {thread_id}: Đã đóng profile {profile_id} do trang không tải xong sau khi nhập email khôi phục")
-                        except Exception as e:
-                            print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {e}")
-                        
-                        # Giải phóng email khôi phục
-                        release_recovery_email(thread_id)
-                        
-                        # Chuyển đến profile tiếp theo
-                        mark_profile_as_completed(profile_id)
-                        continue
+                    # Đợi trang tải xong
+                    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                    time.sleep(5)  # Đợi thêm để trang hoàn tất và email xác minh được gửi
                 except TimeoutException:
                     print(f"Thread {thread_id}: Email input or Next button not found")
                     release_recovery_email(thread_id)
-                    
-                    # Đóng profile và chuyển sang profile tiếp theo
-                    close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                    try:
-                        requests.get(close_url)
-                        print(f"Thread {thread_id}: Đã đóng profile {profile_id} do không tìm thấy phần tử Next")
-                    except Exception as e:
-                        print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {e}")
-                    
-                    mark_profile_as_completed(profile_id)
-                    continue
                 except Exception as e:
                     print(f"Thread {thread_id}: Error entering recovery email: {e}")
                     release_recovery_email(thread_id)
-                
-                # 5.5 Kiểm tra xem có xuất hiện phần tử nhập mã xác minh trong vòng 10 giây không
-                try:
-                    print(f"Thread {thread_id}: Đang kiểm tra xem phần tử nhập mã xác minh (iOttText) có xuất hiện không (đợi tối đa 10 giây)...")
-                    verification_code_input = WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.XPATH, "//input[@id='iOttText']"))
-                    )
-                    print(f"Thread {thread_id}: Đã tìm thấy phần tử nhập mã xác minh, tiếp tục quy trình")
-                except TimeoutException:
-                    print(f"Thread {thread_id}: Không tìm thấy phần tử nhập mã xác minh (iOttText) sau 10 giây")
-                    
-                    # Đánh dấu lỗi vào Excel
-                    queue_excel_update(row=row_number, column=10, value="Lỗi Không Hiển Thị Ô Nhập Mã Xác Minh", save_now=True)
-                    
-                    # Đóng profile
-                    close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                    try:
-                        requests.get(close_url)
-                        print(f"Thread {thread_id}: Đã đóng profile {profile_id} do không hiển thị ô nhập mã xác minh")
-                    except Exception as e:
-                        print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {e}")
-                    
-                    # Giải phóng email khôi phục
-                    release_recovery_email(thread_id)
-                    
-                    # Chuyển đến profile tiếp theo
-                    mark_profile_as_completed(profile_id)
-                    continue
-                except Exception as e:
-                    print(f"Thread {thread_id}: Lỗi khi kiểm tra phần tử nhập mã xác minh: {e}")
-                    
-                    # Đánh dấu lỗi vào Excel
-                    queue_excel_update(row=row_number, column=10, value=f"Lỗi Kiểm Tra Phần Tử Mã Xác Minh: {str(e)[:30]}", save_now=True)
-                    
-                    # Đóng profile
-                    close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
-                    try:
-                        requests.get(close_url)
-                        print(f"Thread {thread_id}: Đã đóng profile {profile_id} do lỗi kiểm tra phần tử mã xác minh")
-                    except Exception as close_e:
-                        print(f"Thread {thread_id}: Lỗi khi đóng profile {profile_id}: {close_e}")
-                    
-                    # Giải phóng email khôi phục
-                    release_recovery_email(thread_id)
-                    
-                    # Chuyển đến profile tiếp theo
-                    mark_profile_as_completed(profile_id)
-                    continue
                 
                 # 6. Đọc email để lấy mã xác minh
                 verification_code = None
@@ -1836,7 +1591,9 @@ def process_profile(thread_id, api_key, window_pos):
                 if not verification_code:
                     print(f"Thread {thread_id}: Không thể lấy được mã xác minh sau {max_retries_code} lần thử")
                     # Đánh dấu là thất bại trong việc xác minh email
-                    queue_excel_update(row=row_number, column=10, value="Lỗi Xác Minh Email", save_now=True)
+                    with profiles_lock:
+                        worksheet.cell(row=row_number, column=10).value = "Lỗi Xác Minh Email"
+                        save_excel_with_retry()
                     
                     release_recovery_email(thread_id)
                     continue
@@ -1848,7 +1605,7 @@ def process_profile(thread_id, api_key, window_pos):
                     )
                     simulate_human_typing(code_input, verification_code)
                     print(f"Thread {thread_id}: Đã nhập mã xác minh: {verification_code}")
-                    release_recovery_email(thread_id)
+                    
                     # Click nút xác nhận
                     verify_button = WebDriverWait(driver, 20).until(
                         EC.element_to_be_clickable((By.XPATH, "//input[@id='iNext']"))
@@ -1857,16 +1614,18 @@ def process_profile(thread_id, api_key, window_pos):
                     print(f"Thread {thread_id}: Clicked Next button after entering verification code")
                     
                     # Đợi trang tải xong
-                    #time.sleep(2)
+                    time.sleep(10)
                     
+                    # Lưu email khôi phục vào Cột K (cột thứ 11)
+                    with profiles_lock:
+                        worksheet.cell(row=row_number, column=11).value = gmail
+                        save_excel_with_retry()
+                        print(f"Thread {thread_id}: Đã lưu email khôi phục {gmail} vào cột K")
                     
                 except TimeoutException:
                     print(f"Thread {thread_id}: Verification code input or button not found")
-                    release_recovery_email(thread_id)
-
                 except Exception as e:
                     print(f"Thread {thread_id}: Error entering verification code: {e}")
-                    release_recovery_email(thread_id)
                 
                 # Giải phóng email khôi phục để các thread khác có thể sử dụng
                 release_recovery_email(thread_id)
@@ -1882,31 +1641,51 @@ def process_profile(thread_id, api_key, window_pos):
                     print(f"Thread {thread_id}: Đánh dấu tài khoản này là Thất Bại")
                     
                     # Lưu kết quả vào Excel
-                    queue_excel_update(row=row_number, column=10, value="Thất Bại", save_now=True)
-                    print(f"Thread {thread_id}: Đã đánh dấu Thất Bại cho profile {profile_id}")
+                    with profiles_lock:
+                        # Đánh dấu thất bại vào cột J (cột thứ 10)
+                        worksheet.cell(row=row_number, column=10).value = "Thất Bại"
+                        
+                        # Lưu file Excel
+                        save_excel_with_retry()
+                        print(f"Thread {thread_id}: Đã đánh dấu Thất Bại cho profile {profile_id}")
                 elif refresh_token:
                     print(f"Thread {thread_id}: Successfully got refresh token")
                     
                     # Lưu thông tin vào file Excel
-                    updates = [
-                        ExcelUpdateTask(row=row_number, column=7, value=f"{username}@outlook.com"),
-                        ExcelUpdateTask(row=row_number, column=8, value=password),
-                        ExcelUpdateTask(row=row_number, column=9, value=refresh_token),
-                        ExcelUpdateTask(row=row_number, column=10, value="Thành Công"),
-                        ExcelUpdateTask(row=row_number, column=11, value=gmail)
-                    ]
-                    queue_excel_batch_update(updates, save_after=True)
-                    print(f"Thread {thread_id}: Saved account info to Excel for profile {profile_id} and removed red highlight")
+                    with profiles_lock:
+                        # Lưu email vào cột G (cột thứ 7)
+                        worksheet.cell(row=row_number, column=7).value = f"{username}@outlook.com"
+                        
+                        # Lưu mật khẩu vào cột H (cột thứ 8)
+                        worksheet.cell(row=row_number, column=8).value = password
+                        
+                        # Lưu refresh token vào cột I (cột thứ 9)
+                        worksheet.cell(row=row_number, column=9).value = refresh_token
+                        
+                        # Đánh dấu thành công vào cột J (cột thứ 10)
+                        worksheet.cell(row=row_number, column=10).value = "Thành Công"
+                        
+                        # Đặt màu dòng thành mặc định (loại bỏ màu đỏ nếu có)
+                        for col in range(1, 11):
+                            worksheet.cell(row=row_number, column=col).fill = default_fill
+                        
+                        # Lưu file Excel
+                        save_excel_with_retry()
+                        print(f"Thread {thread_id}: Saved account info to Excel for profile {profile_id} and removed red highlight")
                 else:
                     print(f"Thread {thread_id}: Failed to get refresh token")
                     
                     # Lưu kết quả vào Excel - đánh dấu là Lỗi
-                    queue_excel_update(row=row_number, column=10, value="Lỗi Token", save_now=True)
-                    print(f"Thread {thread_id}: Đã đánh dấu Lỗi Token cho profile {profile_id}")
+                    with profiles_lock:
+                        worksheet.cell(row=row_number, column=10).value = "Lỗi Token"
+                        save_excel_with_retry()
+                        print(f"Thread {thread_id}: Đã đánh dấu Lỗi Token cho profile {profile_id}")
             except Exception as e:
                 print(f"Thread {thread_id}: Error during Outlook registration process: {e}")
                 # Đảm bảo đánh dấu lỗi vào cột J
-                queue_excel_update(row=row_number, column=10, value=f"Lỗi: {str(e)[:50]}", save_now=True)
+                with profiles_lock:
+                    worksheet.cell(row=row_number, column=10).value = f"Lỗi: {str(e)[:50]}"
+                    save_excel_with_retry()
         finally:
             # Đóng profile qua API
             close_url = f"http://127.0.0.1:19995/api/v3/profiles/close/{profile_id}"
@@ -1921,232 +1700,33 @@ def process_profile(thread_id, api_key, window_pos):
             time.sleep(1)
 
 # ---------------------------------------
-# Các hàm quản lý truy cập Excel qua hàng đợi
-# ---------------------------------------
-def start_excel_worker():
-    """Khởi động worker thread xử lý các thao tác Excel"""
-    global excel_worker_running, excel_worker_thread
-    
-    if excel_worker_running:
-        print("Excel worker đã đang chạy")
-        return
-    
-    excel_worker_running = True
-    excel_worker_thread = threading.Thread(target=excel_worker_function)
-    excel_worker_thread.daemon = True  # Thread sẽ tự kết thúc khi thread chính kết thúc
-    excel_worker_thread.start()
-    print("Excel worker đã được khởi động")
-
-def stop_excel_worker():
-    """Dừng worker thread xử lý các thao tác Excel"""
-    global excel_worker_running
-    
-    if not excel_worker_running:
-        return
-    
-    excel_worker_running = False
-    # Thêm một tác vụ None vào queue để báo hiệu worker dừng lại
-    excel_update_queue.put(None)
-    
-    # Chờ worker dừng hoàn toàn
-    if excel_worker_thread and excel_worker_thread.is_alive():
-        excel_worker_thread.join(timeout=5)
-        print("Excel worker đã được dừng lại")
-
-def excel_worker_function():
-    """Hàm xử lý các thao tác Excel trong thread riêng biệt"""
-    global excel_worker_running
-    
-    print("Excel worker thread đã bắt đầu")
-    last_save_time = time.time()
-    save_interval = 3  # Giảm thời gian giữa các lần lưu xuống 5 giây (trước đây là 10)
-    max_updates_before_save = 5  # Giảm số lượng cập nhật trước khi lưu xuống 5 (trước đây là 10)
-    batch_updates = []
-    
-    while excel_worker_running:
-        try:
-            # Đợi tác vụ từ hàng đợi với timeout ngắn hơn (0.5s thay vì 1s) để phản ứng nhanh hơn
-            try:
-                task = excel_update_queue.get(timeout=0.5)
-            except queue.Empty:
-                # Nếu thời gian giữa các lần lưu đã đủ và có cập nhật chưa lưu, thì lưu file Excel
-                if batch_updates and time.time() - last_save_time > save_interval:
-                    process_batch_updates(batch_updates)
-                    batch_updates = []
-                    last_save_time = time.time()
-                continue
-            
-            # Nếu nhận được tác vụ None, thoát khỏi vòng lặp
-            if task is None:
-                break
-            
-            # Đánh dấu save_now = True cho bất kỳ cập nhật quan trọng
-            is_important_update = False
-            
-            # Xử lý tác vụ cập nhật đơn lẻ
-            if isinstance(task, ExcelUpdateTask):
-                batch_updates.append(task)
-                # Kiểm tra nếu đây là cập nhật quan trọng (như trạng thái tài khoản)
-                if task.column == 10:  # Cột J - trạng thái
-                    is_important_update = True
-                    
-                # Nếu batch đã đủ lớn hoặc đã đến thời gian lưu, hoặc đây là cập nhật quan trọng, tiến hành cập nhật Excel
-                if len(batch_updates) >= max_updates_before_save or time.time() - last_save_time > save_interval or is_important_update:
-                    process_batch_updates(batch_updates)
-                    batch_updates = []
-                    last_save_time = time.time()
-            
-            # Xử lý tác vụ cập nhật hàng loạt
-            elif isinstance(task, ExcelBatchUpdateTask):
-                # Thêm các cập nhật vào batch
-                batch_updates.extend(task.updates)
-                
-                # Kiểm tra nếu có cập nhật quan trọng trong batch
-                for update in task.updates:
-                    if update.column == 10:  # Cột J - trạng thái
-                        is_important_update = True
-                        break
-                
-                # Nếu được yêu cầu lưu ngay, hoặc batch đã đủ lớn, hoặc đây là cập nhật quan trọng, tiến hành cập nhật Excel
-                if task.save_after or len(batch_updates) >= max_updates_before_save or is_important_update:
-                    process_batch_updates(batch_updates)
-                    batch_updates = []
-                    last_save_time = time.time()
-            
-            # Đánh dấu tác vụ đã hoàn thành
-            excel_update_queue.task_done()
-            
-        except Exception as e:
-            print(f"Lỗi trong Excel worker thread: {e}")
-            traceback.print_exc()
-            
-            # Bổ sung: Lưu ngay lập tức các cập nhật hiện có nếu có lỗi
-            if batch_updates:
-                try:
-                    print("Lỗi xảy ra, lưu ngay các cập nhật hiện có để tránh mất dữ liệu")
-                    process_batch_updates(batch_updates)
-                    batch_updates = []
-                except Exception as save_error:
-                    print(f"Không thể lưu các cập nhật khi xảy ra lỗi: {save_error}")
-    
-    # Xử lý các cập nhật còn lại trước khi thoát
-    if batch_updates:
-        try:
-            process_batch_updates(batch_updates)
-            print("Đã lưu các cập nhật còn lại trước khi thoát Excel worker")
-        except Exception as e:
-            print(f"Lỗi khi xử lý cập nhật batch cuối cùng: {e}")
-    
-    print("Excel worker thread đã kết thúc")
-
-def process_batch_updates(updates):
-    """Xử lý hàng loạt các cập nhật Excel"""
-    with excel_io_lock:
-        try:
-            # Áp dụng các cập nhật
-            for update in updates:
-                # Cập nhật giá trị
-                worksheet.cell(row=update.row, column=update.column).value = update.value
-                
-                # Cập nhật định dạng nếu có
-                if update.fill:
-                    # Nếu có fill_range, áp dụng định dạng cho một vùng cột
-                    if update.fill_range:
-                        start_col, end_col = update.fill_range
-                        for col in range(start_col, end_col + 1):
-                            worksheet.cell(row=update.row, column=col).fill = update.fill
-                    else:
-                        # Nếu không, áp dụng định dạng cho một ô
-                        worksheet.cell(row=update.row, column=update.column).fill = update.fill
-            
-            # Lưu file
-            save_excel_with_retry(max_retries=3)
-            
-        except Exception as e:
-            print(f"Lỗi khi xử lý batch updates: {e}")
-            traceback.print_exc()
-
-def queue_excel_update(row, column, value, fill=None, fill_range=None, save_now=False):
-    """
-    Thêm một cập nhật Excel vào hàng đợi xử lý
-    
-    Args:
-        row: Số hàng cần cập nhật (bắt đầu từ 1)
-        column: Số cột cần cập nhật (bắt đầu từ 1)
-        value: Giá trị cần gán
-        fill: Định dạng tô màu (tùy chọn)
-        fill_range: Dải cột để áp dụng fill (tùy chọn), dạng (start_col, end_col)
-        save_now: Có lưu ngay sau khi cập nhật hay không
-    """
-    task = ExcelUpdateTask(row, column, value, fill, fill_range)
-    excel_update_queue.put(task)
-    
-    # Nếu cần lưu ngay, thêm một None vào hàng đợi để trigger việc lưu
-    if save_now:
-        excel_update_queue.put(ExcelBatchUpdateTask([], True))
-
-def queue_excel_batch_update(updates, save_after=True):
-    """
-    Thêm một loạt cập nhật Excel vào hàng đợi xử lý
-    
-    Args:
-        updates: Danh sách các ExcelUpdateTask
-        save_after: Có lưu sau khi cập nhật hay không
-    """
-    task = ExcelBatchUpdateTask(updates, save_after)
-    excel_update_queue.put(task)
-
-# ---------------------------------------
 # Main
 # ---------------------------------------
 if __name__ == "__main__":
     # Khôi phục trạng thái từ lần chạy trước
     recover_from_previous_run()
-    
-    # Khởi động worker thread xử lý Excel
-    start_excel_worker()
-    
-    # Thông báo cho người dùng biết về cải tiến chống nghẽn cổ chai
-    print("Đã khởi động hệ thống quản lý hàng đợi Excel để tránh nghẽn cổ chai khi nhiều thread cùng cập nhật.")
-    print("Các thao tác Excel sẽ được thực hiện trong một thread riêng biệt.")
 
     # Xác định số lượng luồng dựa trên số API key có sẵn
     num_threads = min(7, len(api_keys))
     
     if num_threads == 0:
         print("Không có API key nào trong file proxy.txt. Không thể chạy chương trình.")
-        stop_excel_worker()  # Đảm bảo dừng Excel worker
         exit(1)
     
     # Tạo và chạy các luồng dựa trên số API key có sẵn
     threads = []
     window_positions = ["0,0", "1800,0", "3600,0", "0,1080", "1800,1080", "3600,1080", "0,2160"]
     
-    try:
-        for i in range(num_threads):
-            thread = threading.Thread(
-                target=process_profile, 
-                args=(i+1, api_keys[i], window_positions[i]),
-                name=f"Profile-Thread-{i+1}"  # Đặt tên cho thread để dễ theo dõi
-            )
-            threads.append(thread)
-            thread.start()
-            time.sleep(0.5)  # Khởi động các thread với độ trễ để tránh xung đột
-            
-        # Chờ tất cả các luồng hoàn thành
-        for thread in threads:
-            thread.join()
-    except KeyboardInterrupt:
-        print("\nChuong trình bị ngắt bởi người dùng. Đang dọn dẹp...")
-    except Exception as e:
-        print(f"\nLỗi không mong muốn: {e}")
-        traceback.print_exc()
-    finally:
-        # Dừng worker thread xử lý Excel
-        stop_excel_worker()
-        # Đợi queue xử lý xong tất cả các nhiệm vụ
-        excel_update_queue.join()
-        # Đảm bảo chạy hàm lưu trạng thái trước khi thoát
-        save_state_on_exit()
+    for i in range(num_threads):
+        thread = threading.Thread(
+            target=process_profile, 
+            args=(i+1, api_keys[i], window_positions[i])
+        )
+        threads.append(thread)
+        thread.start()
+        
+    # Chờ tất cả các luồng hoàn thành
+    for thread in threads:
+        thread.join()
 
-    print("\nĐã xử lý xong tất cả các profile.")
+    print("\nCompleted processing all profiles.")
